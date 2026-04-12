@@ -418,6 +418,8 @@ class RecorderApp(tk.Tk):
         # Device lists populated by _refresh_devices()
         self._midi_ports: list[str] = []
         self._audio_devices: list[dict] = []
+        self._midi_active: bool = False
+        self._audio_active: bool = False
 
         # Session output metadata (set in _start_recording)
         self._session_out_dir: str = ""
@@ -451,6 +453,8 @@ class RecorderApp(tk.Tk):
         ttk.Button(midi_frame, text="Refresh", command=self._refresh_devices).grid(
             row=0, column=1, padx=4
         )
+        self._midi_ind = tk.Label(midi_frame, text="", font=("Segoe UI", 10))
+        self._midi_ind.grid(row=0, column=2, padx=6)
 
         # ---- Audio device ----
         audio_frame = ttk.LabelFrame(self, text="Audio Input Device")
@@ -460,7 +464,9 @@ class RecorderApp(tk.Tk):
         self._audio_combo = ttk.Combobox(
             audio_frame, textvariable=self._audio_var, width=44, state="readonly"
         )
-        self._audio_combo.grid(row=0, column=0, padx=4, pady=4, columnspan=2)
+        self._audio_combo.grid(row=0, column=0, padx=4, pady=4)
+        self._audio_ind = tk.Label(audio_frame, text="", font=("Segoe UI", 10))
+        self._audio_ind.grid(row=0, column=1, padx=6)
 
         # ---- Audio settings ----
         settings_frame = ttk.LabelFrame(self, text="Audio Settings")
@@ -562,20 +568,36 @@ class RecorderApp(tk.Tk):
     def _refresh_devices(self) -> None:
         # MIDI ports
         self._midi_ports = MidiRecorder.get_port_names()
+        self._midi_active = bool(self._midi_ports)
         self._midi_combo["values"] = (
             self._midi_ports if self._midi_ports else ["(no MIDI devices found)"]
         )
         if self._midi_ports:
             self._midi_combo.current(0)
+            self._midi_combo.configure(state="readonly")
+        else:
+            self._midi_combo.configure(state="disabled")
+        if self._midi_active:
+            self._midi_ind.configure(text=f"✔ {len(self._midi_ports)} device(s)", fg="#2e7d32")
+        else:
+            self._midi_ind.configure(text="— not found", fg="#9e9e9e")
 
         # Audio input devices
         self._audio_devices = AudioRecorder.get_device_list()
+        self._audio_active = bool(self._audio_devices)
         audio_labels = [f"[{d['index']}] {d['name']}" for d in self._audio_devices]
         self._audio_combo["values"] = (
             audio_labels if audio_labels else ["(no input devices found)"]
         )
         if self._audio_devices:
             self._audio_combo.current(0)
+            self._audio_combo.configure(state="readonly")
+        else:
+            self._audio_combo.configure(state="disabled")
+        if self._audio_active:
+            self._audio_ind.configure(text=f"✔ {len(self._audio_devices)} device(s)", fg="#2e7d32")
+        else:
+            self._audio_ind.configure(text="— not found", fg="#9e9e9e")
 
     def _browse_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self._out_dir_var.get())
@@ -618,24 +640,19 @@ class RecorderApp(tk.Tk):
             self._stop_recording()
 
     def _start_recording(self) -> None:
-        # --- Validate MIDI ---
-        if not self._midi_ports:
-            messagebox.showerror("Error", "No MIDI device found. Connect a device and click Refresh.")
-            return
-        midi_idx = self._midi_combo.current()
-        if midi_idx < 0:
-            messagebox.showerror("Error", "Please select a MIDI device.")
+        use_midi = self._midi_active
+        use_audio = self._audio_active
+
+        if not use_midi and not use_audio:
+            messagebox.showerror("Error", "No MIDI or audio device found. Connect at least one device and click Refresh.")
             return
 
-        # --- Validate Audio ---
-        if not self._audio_devices:
-            messagebox.showerror("Error", "No audio input device found.")
-            return
-        audio_list_idx = self._audio_combo.current()
-        if audio_list_idx < 0:
-            messagebox.showerror("Error", "Please select an audio input device.")
-            return
-        audio_sd_idx = self._audio_devices[audio_list_idx]["index"]
+        # --- MIDI device ---
+        midi_idx = self._midi_combo.current() if use_midi else -1
+
+        # --- Audio device ---
+        audio_list_idx = self._audio_combo.current() if use_audio else -1
+        audio_sd_idx = self._audio_devices[audio_list_idx]["index"] if use_audio and audio_list_idx >= 0 else -1
 
         sample_rate = int(self._sr_var.get())
         channels = int(self._ch_var.get())
@@ -680,19 +697,22 @@ class RecorderApp(tk.Tk):
         self._session_ch = channels
 
         # --- Open MIDI port ---
-        try:
-            self._midi_rec.start(midi_idx, self._session_start_perf)
-        except Exception as exc:
-            messagebox.showerror("MIDI Error", f"Cannot open MIDI port:\n{exc}")
-            return
+        if use_midi:
+            try:
+                self._midi_rec.start(midi_idx, self._session_start_perf)
+            except Exception as exc:
+                messagebox.showerror("MIDI Error", f"Cannot open MIDI port:\n{exc}")
+                return
 
         # --- Open audio stream ---
-        try:
-            self._audio_rec.start(audio_sd_idx, sample_rate, channels)
-        except Exception as exc:
-            self._midi_rec.stop()
-            messagebox.showerror("Audio Error", f"Cannot open audio device:\n{exc}")
-            return
+        if use_audio:
+            try:
+                self._audio_rec.start(audio_sd_idx, sample_rate, channels)
+            except Exception as exc:
+                if use_midi:
+                    self._midi_rec.stop()
+                messagebox.showerror("Audio Error", f"Cannot open audio device:\n{exc}")
+                return
 
         self._recording = True
         self._start_btn.configure(text="⏹  STOP")
@@ -700,14 +720,18 @@ class RecorderApp(tk.Tk):
         start_ts = self._session_start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
         self._status_var.set(f"Recording…  started {start_ts}")
         self._log_msg(f"[START] {start_ts}")
-        self._log_msg(
-            f"  MIDI  → port {midi_idx}: {self._midi_ports[midi_idx]}"
-        )
-        self._log_msg(
-            f"  Audio → [{audio_sd_idx}] "
-            f"{self._audio_devices[audio_list_idx]['name']}  "
-            f"{sample_rate} Hz  {'Mono' if channels == 1 else 'Stereo'}"
-        )
+        if use_midi:
+            self._log_msg(f"  MIDI  → port {midi_idx}: {self._midi_ports[midi_idx]}")
+        else:
+            self._log_msg("  MIDI  → not connected (skipped)")
+        if use_audio:
+            self._log_msg(
+                f"  Audio → [{audio_sd_idx}] "
+                f"{self._audio_devices[audio_list_idx]['name']}  "
+                f"{sample_rate} Hz  {'Mono' if channels == 1 else 'Stereo'}"
+            )
+        else:
+            self._log_msg("  Audio → not connected (skipped)")
         ts_mode_label = f"NTP ({self._ntp_server_var.get()})" if use_ntp else "System clock (UTC)"
         self._log_msg(f"  Clock  → {ts_mode_label}")
 
@@ -722,18 +746,17 @@ class RecorderApp(tk.Tk):
     def _stop_worker(self) -> None:
         """Worker thread: stop recorders, post-process, save files, update GUI."""
         try:
-            # Stop audio first to get the most accurate stop perf_counter
-            stop_perf = self._audio_rec.stop()
-            self._midi_rec.stop()
+            # Stop active streams; use fallback perf_counter if audio is not active
+            if self._audio_active:
+                stop_perf = self._audio_rec.stop()
+            else:
+                stop_perf = time.perf_counter()
+            if self._midi_active:
+                self._midi_rec.stop()
             self._session_stop_perf = stop_perf
 
             tag = self._session_tag
             out_dir = self._session_out_dir
-
-            # ---- Save WAV ----
-            wav_name = f"{tag}_recording.wav"
-            wav_path = os.path.join(out_dir, wav_name)
-            frames_saved = self._audio_rec.save_wav(wav_path)
 
             # ---- Build session timestamps ----
             start_ts = self._session_start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
@@ -741,49 +764,47 @@ class RecorderApp(tk.Tk):
             stop_utc = self._session_start_utc + datetime.timedelta(seconds=duration_s)
             stop_ts = stop_utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
-            # ---- Save audio CSV ----
-            audio_csv_path = os.path.join(out_dir, f"{tag}_audio.csv")
-            save_audio_csv(
-                wav_filename=wav_name,
-                start_ts=start_ts,
-                end_ts=stop_ts,
-                sample_rate=self._session_sr,
-                channels=self._session_ch,
-                duration_seconds=duration_s,
-                filepath=audio_csv_path,
-            )
-
-            # ---- Post-process MIDI ----
-            raw_events = self._midi_rec.get_events()
-            midi_rows = process_midi_events(
-                raw_events=raw_events,
-                session_start_perf=self._session_start_perf,
-                session_start_utc=self._session_start_utc,
-                session_stop_perf=self._session_stop_perf,
-            )
-
-            # ---- Save MIDI CSV ----
-            midi_csv_path = os.path.join(out_dir, f"{tag}_midi.csv")
-            save_midi_csv(midi_rows, midi_csv_path)
-
-            # ---- Report ----
             self._gui_queue.put(("log", f"[STOP]  {stop_ts}"))
             self._gui_queue.put(("log", f"  Duration     : {duration_s:.3f} s"))
-            self._gui_queue.put(("log", f"  Audio frames : {frames_saved}"))
-            self._gui_queue.put(("log", f"  WAV          : {wav_path}"))
-            self._gui_queue.put(("log", f"  Audio CSV    : {audio_csv_path}"))
-            self._gui_queue.put(
-                (
-                    "log",
-                    f"  MIDI CSV     : {midi_csv_path}  ({len(midi_rows)} rows)",
+
+            # ---- Save WAV + audio CSV (only if audio was active) ----
+            if self._audio_active:
+                wav_name = f"{tag}_recording.wav"
+                wav_path = os.path.join(out_dir, wav_name)
+                frames_saved = self._audio_rec.save_wav(wav_path)
+                audio_csv_path = os.path.join(out_dir, f"{tag}_audio.csv")
+                save_audio_csv(
+                    wav_filename=wav_name,
+                    start_ts=start_ts,
+                    end_ts=stop_ts,
+                    sample_rate=self._session_sr,
+                    channels=self._session_ch,
+                    duration_seconds=duration_s,
+                    filepath=audio_csv_path,
                 )
-            )
-            self._gui_queue.put(
-                (
-                    "status",
-                    f"Done — {len(midi_rows)} MIDI events · {duration_s:.2f} s audio",
+                self._gui_queue.put(("log", f"  Audio frames : {frames_saved}"))
+                self._gui_queue.put(("log", f"  WAV          : {wav_path}"))
+                self._gui_queue.put(("log", f"  Audio CSV    : {audio_csv_path}"))
+
+            # ---- Post-process MIDI + save CSV (only if MIDI was active) ----
+            if self._midi_active:
+                raw_events = self._midi_rec.get_events()
+                midi_rows = process_midi_events(
+                    raw_events=raw_events,
+                    session_start_perf=self._session_start_perf,
+                    session_start_utc=self._session_start_utc,
+                    session_stop_perf=self._session_stop_perf,
                 )
-            )
+                midi_csv_path = os.path.join(out_dir, f"{tag}_midi.csv")
+                save_midi_csv(midi_rows, midi_csv_path)
+                self._gui_queue.put(
+                    ("log", f"  MIDI CSV     : {midi_csv_path}  ({len(midi_rows)} rows)")
+                )
+                midi_summary = f"{len(midi_rows)} MIDI events"
+            else:
+                midi_summary = "no MIDI"
+            audio_summary = f"{duration_s:.2f} s audio" if self._audio_active else "no audio"
+            self._gui_queue.put(("status", f"Done — {midi_summary} · {audio_summary}"))
             self._gui_queue.put(("stop_done",))
 
         except Exception as exc:
