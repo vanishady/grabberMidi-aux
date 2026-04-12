@@ -1,0 +1,4 @@
+python-rtmidi
+sounddevice
+soundfile
+ntplib
