@@ -194,11 +194,13 @@ class AudioRecorder:
 
     @staticmethod
     def get_device_list() -> list[dict]:
-        """Return list of dicts with 'index' and 'name' for input-capable devices."""
+        """Return list of dicts with 'index', 'name', and 'api' for input-capable devices."""
         result = []
+        hostapis = sd.query_hostapis()
         for i, d in enumerate(sd.query_devices()):
             if d["max_input_channels"] > 0:
-                result.append({"index": i, "name": d["name"]})
+                api_name = hostapis[d["hostapi"]]["name"]
+                result.append({"index": i, "name": d["name"], "api": api_name})
         return result
 
     # ------------------------------------------------------------------
@@ -551,7 +553,7 @@ class RecorderApp(tk.Tk):
         out_frame = ttk.LabelFrame(self, text="Output Folder")
         out_frame.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
 
-        self._out_dir_var = tk.StringVar(value=os.getcwd())
+        self._out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "data"))
         ttk.Entry(out_frame, textvariable=self._out_dir_var, width=44).grid(
             row=0, column=0, padx=4, pady=4
         )
@@ -628,7 +630,7 @@ class RecorderApp(tk.Tk):
         # Audio input devices
         self._audio_devices = AudioRecorder.get_device_list()
         self._audio_active = bool(self._audio_devices)
-        audio_labels = [f"[{d['index']}] {d['name']}" for d in self._audio_devices]
+        audio_labels = [f"[{d['index']}] {d['name']}  ({d['api']})" for d in self._audio_devices]
         self._audio_combo["values"] = (
             audio_labels if audio_labels else ["(no input devices found)"]
         )
