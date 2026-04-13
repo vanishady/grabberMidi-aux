@@ -13,6 +13,7 @@ Requirements:
 """
 from __future__ import annotations
 
+import collections
 import csv
 import datetime
 import os
@@ -181,6 +182,11 @@ class AudioRecorder:
         self._chunk_queue: queue.Queue[np.ndarray] = queue.Queue()
         self.sample_rate: int = 44100
         self.channels: int = 1
+        # Rolling buffer for real-time waveform visualization
+        self._viz_lock = threading.Lock()
+        self._viz_chunks: collections.deque = collections.deque()
+        self._viz_total_frames: int = 0
+        self._viz_max_frames: int = 0
 
     # ------------------------------------------------------------------
     # Device enumeration
@@ -209,6 +215,10 @@ class AudioRecorder:
 
         self.sample_rate = sample_rate
         self.channels = channels
+        self._viz_max_frames = int(sample_rate * 0.5)  # 0.5 s rolling window
+        with self._viz_lock:
+            self._viz_chunks.clear()
+            self._viz_total_frames = 0
 
         self._stream = sd.InputStream(
             device=device_index,
@@ -228,7 +238,15 @@ class AudioRecorder:
         status: sd.CallbackFlags,
     ) -> None:
         # indata is a view into a PortAudio buffer — always copy before queuing
-        self._chunk_queue.put(indata.copy())
+        chunk = indata.copy()
+        self._chunk_queue.put(chunk)
+        # Update visualization rolling buffer (O(1) amortised)
+        with self._viz_lock:
+            self._viz_chunks.append(chunk)
+            self._viz_total_frames += len(chunk)
+            while self._viz_total_frames > self._viz_max_frames and len(self._viz_chunks) > 1:
+                removed = self._viz_chunks.popleft()
+                self._viz_total_frames -= len(removed)
 
     def stop(self) -> float:
         """
@@ -240,6 +258,9 @@ class AudioRecorder:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        with self._viz_lock:
+            self._viz_chunks.clear()
+            self._viz_total_frames = 0
         return stop_perf
 
     def save_wav(self, filepath: str) -> int:
@@ -261,6 +282,14 @@ class AudioRecorder:
 
         sf.write(filepath, audio_data, self.sample_rate, subtype="PCM_16")
         return len(audio_data)
+
+    def get_viz_data(self) -> "np.ndarray | None":
+        """Return a copy of the current rolling waveform buffer (GUI thread safe)."""
+        with self._viz_lock:
+            if not self._viz_chunks:
+                return None
+            chunks = list(self._viz_chunks)
+        return np.concatenate(chunks, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +584,20 @@ class RecorderApp(tk.Tk):
         )
         self._log.pack(fill="both", expand=True, padx=4, pady=4)
 
+        # ---- Waveform visualizer ----
+        wave_frame = ttk.LabelFrame(self, text="Audio Waveform (real-time)")
+        wave_frame.grid(row=8, column=0, columnspan=2, sticky="ew", **pad)
+
+        self._wave_canvas = tk.Canvas(
+            wave_frame,
+            bg="#1a1a2e",
+            height=80,
+            highlightthickness=0,
+        )
+        self._wave_canvas.pack(fill="x", expand=True, padx=4, pady=4)
+        # Draw placeholder centre line; redrawn once the canvas has a real width
+        self._wave_canvas.after(100, self._clear_waveform)
+
         self.columnconfigure(0, weight=1)
 
     # ------------------------------------------------------------------
@@ -716,6 +759,7 @@ class RecorderApp(tk.Tk):
 
         self._recording = True
         self._start_btn.configure(text="⏹  STOP")
+        self.after(50, self._update_waveform)  # kick off real-time waveform loop
 
         start_ts = self._session_start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
         self._status_var.set(f"Recording…  started {start_ts}")
@@ -816,6 +860,57 @@ class RecorderApp(tk.Tk):
         """Called from main thread via queue poll after the worker finishes."""
         self._recording = False
         self._start_btn.configure(state="normal", text="▶  START")
+        self._clear_waveform()
+
+    # ------------------------------------------------------------------
+    # Waveform visualizer
+    # ------------------------------------------------------------------
+
+    def _update_waveform(self) -> None:
+        """Called periodically (~20 fps) while recording to refresh the canvas."""
+        if not self._recording:
+            return
+        data = self._audio_rec.get_viz_data()
+        if data is not None and len(data) > 0:
+            self._draw_waveform(data)
+        self.after(50, self._update_waveform)
+
+    def _draw_waveform(self, data: np.ndarray) -> None:
+        canvas = self._wave_canvas
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 2 or h < 2:
+            return
+
+        canvas.delete("wave")
+
+        # Use first channel only
+        samples = data[:, 0].astype(np.float32) if data.ndim > 1 else data.astype(np.float32)
+
+        # Downsample to canvas pixel width
+        n = len(samples)
+        if n > w:
+            samples = samples[np.linspace(0, n - 1, w, dtype=int)]
+
+        # Normalise int16 → [-1, 1] and map to canvas y coordinates
+        samples /= 32768.0
+        mid = h / 2.0
+        scale = mid * 0.9
+
+        x = np.linspace(0, w, len(samples))
+        y = mid - samples * scale
+        coords = np.column_stack([x, y]).flatten().tolist()
+
+        if len(coords) >= 4:
+            canvas.create_line(*coords, fill="#00e676", tags="wave", width=1)
+
+    def _clear_waveform(self) -> None:
+        """Draw a flat centre line (shown when not recording)."""
+        canvas = self._wave_canvas
+        canvas.delete("wave")
+        w = canvas.winfo_width() or 580
+        h = canvas.winfo_height() or 80
+        canvas.create_line(0, h // 2, w, h // 2, fill="#444444", tags="wave")
 
 
 # ---------------------------------------------------------------------------
