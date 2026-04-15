@@ -29,6 +29,7 @@ try:
 except ImportError:
     ntplib = None  # type: ignore
 
+import mido
 import rtmidi
 import sounddevice as sd
 import soundfile as sf
@@ -194,13 +195,11 @@ class AudioRecorder:
 
     @staticmethod
     def get_device_list() -> list[dict]:
-        """Return list of dicts with 'index', 'name', and 'api' for input-capable devices."""
+        """Return list of dicts with 'index' and 'name' for input-capable devices."""
         result = []
-        hostapis = sd.query_hostapis()
         for i, d in enumerate(sd.query_devices()):
             if d["max_input_channels"] > 0:
-                api_name = hostapis[d["hostapi"]]["name"]
-                result.append({"index": i, "name": d["name"], "api": api_name})
+                result.append({"index": i, "name": d["name"]})
         return result
 
     # ------------------------------------------------------------------
@@ -425,6 +424,92 @@ def save_audio_csv(
         )
 
 
+_MIDO_TYPE_MAP: dict[int, str] = {
+    0x80: "note_off",
+    0x90: "note_on",
+    0xA0: "polytouch",
+    0xB0: "control_change",
+    0xC0: "program_change",
+    0xD0: "aftertouch",
+    0xE0: "pitchwheel",
+}
+
+
+def save_midi_file(
+    raw_events: list[tuple[float, list[int]]],
+    session_start_perf: float,
+    session_stop_perf: float,
+    filepath: str,
+) -> None:
+    """
+    Write raw MIDI events to a standard .mid file (format 0, single track).
+
+    Timing is mapped with tempo=500000 µs/beat (120 BPM) and 480 ticks/beat,
+    giving 960 ticks per second — sufficient resolution for sub-millisecond
+    accuracy of the recorded perf_counter timestamps.
+    """
+    TICKS_PER_BEAT = 480
+    TEMPO = 500_000  # µs per beat  →  120 BPM
+    ticks_per_second = TICKS_PER_BEAT * (1_000_000 / TEMPO)  # 960
+
+    mid = mido.MidiFile(type=0, ticks_per_beat=TICKS_PER_BEAT)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=TEMPO, time=0))
+
+    # Compute absolute ticks for each event
+    abs_events: list[tuple[int, mido.Message]] = []
+    for perf_t, message in raw_events:
+        if not message:
+            continue
+        status = message[0]
+        d1 = message[1] if len(message) > 1 else 0
+        d2 = message[2] if len(message) > 2 else 0
+        msg_type_nibble = status & 0xF0
+        channel = status & 0x0F
+
+        offset_s = perf_t - session_start_perf
+        tick = int(round(offset_s * ticks_per_second))
+
+        mido_type = _MIDO_TYPE_MAP.get(msg_type_nibble)
+        if mido_type is None:
+            continue  # skip sysex and other system messages
+
+        try:
+            if mido_type in ("note_on", "note_off"):
+                msg = mido.Message(mido_type, channel=channel, note=d1, velocity=d2, time=0)
+            elif mido_type == "polytouch":
+                msg = mido.Message("polytouch", channel=channel, note=d1, value=d2, time=0)
+            elif mido_type == "control_change":
+                msg = mido.Message("control_change", channel=channel, control=d1, value=d2, time=0)
+            elif mido_type == "program_change":
+                msg = mido.Message("program_change", channel=channel, program=d1, time=0)
+            elif mido_type == "aftertouch":
+                msg = mido.Message("aftertouch", channel=channel, value=d1, time=0)
+            elif mido_type == "pitchwheel":
+                pitch = (d1 | (d2 << 7)) - 8192
+                msg = mido.Message("pitchwheel", channel=channel, pitch=pitch, time=0)
+            else:
+                continue
+        except Exception:
+            continue
+
+        abs_events.append((tick, msg))
+
+    # Convert absolute ticks → delta ticks and append to track
+    prev_tick = 0
+    for abs_tick, msg in sorted(abs_events, key=lambda x: x[0]):
+        delta = abs_tick - prev_tick
+        prev_tick = abs_tick
+        track.append(msg.copy(time=delta))
+
+    # end_of_track at the session stop time so the file has the correct total duration
+    stop_tick = int(round((session_stop_perf - session_start_perf) * ticks_per_second))
+    track.append(mido.MetaMessage("end_of_track", time=max(0, stop_tick - prev_tick)))
+
+    mid.save(filepath)
+
+
 # ---------------------------------------------------------------------------
 # GUI — RecorderApp
 # ---------------------------------------------------------------------------
@@ -553,7 +638,7 @@ class RecorderApp(tk.Tk):
         out_frame = ttk.LabelFrame(self, text="Output Folder")
         out_frame.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
 
-        self._out_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "data"))
+        self._out_dir_var = tk.StringVar(value=os.getcwd()+"\\data")
         ttk.Entry(out_frame, textvariable=self._out_dir_var, width=44).grid(
             row=0, column=0, padx=4, pady=4
         )
@@ -630,7 +715,7 @@ class RecorderApp(tk.Tk):
         # Audio input devices
         self._audio_devices = AudioRecorder.get_device_list()
         self._audio_active = bool(self._audio_devices)
-        audio_labels = [f"[{d['index']}] {d['name']}  ({d['api']})" for d in self._audio_devices]
+        audio_labels = [f"[{d['index']}] {d['name']}" for d in self._audio_devices]
         self._audio_combo["values"] = (
             audio_labels if audio_labels else ["(no input devices found)"]
         )
@@ -732,12 +817,12 @@ class RecorderApp(tk.Tk):
         # --- Session anchor: record perf_counter and UTC together ---
         # Taking perf_counter and utcnow() as close together as possible.
         self._session_start_perf = time.perf_counter()
-        raw_utc = datetime.datetime.utcnow()
+        raw_utc = datetime.datetime.now()
         self._session_start_utc = raw_utc + datetime.timedelta(seconds=ntp_offset)
 
         # --- Save session metadata ---
         self._session_out_dir = out_dir
-        self._session_tag = raw_utc.strftime("%Y%m%d_%H%M%S")
+        self._session_tag = raw_utc.strftime("%Y-%m-%dT%H-%M-%S")
         self._session_sr = sample_rate
         self._session_ch = channels
 
@@ -802,7 +887,9 @@ class RecorderApp(tk.Tk):
             self._session_stop_perf = stop_perf
 
             tag = self._session_tag
-            out_dir = self._session_out_dir
+            #out_dir = self._session_out_dir
+            out_dir = os.path.join(self._session_out_dir, tag)
+            os.makedirs(out_dir, exist_ok=True)
 
             # ---- Build session timestamps ----
             start_ts = self._session_start_utc.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
@@ -843,9 +930,12 @@ class RecorderApp(tk.Tk):
                 )
                 midi_csv_path = os.path.join(out_dir, f"{tag}_midi.csv")
                 save_midi_csv(midi_rows, midi_csv_path)
+                midi_mid_path = os.path.join(out_dir, f"{tag}_recording.mid")
+                save_midi_file(raw_events, self._session_start_perf, self._session_stop_perf, midi_mid_path)
                 self._gui_queue.put(
                     ("log", f"  MIDI CSV     : {midi_csv_path}  ({len(midi_rows)} rows)")
                 )
+                self._gui_queue.put(("log", f"  MIDI file    : {midi_mid_path}"))
                 midi_summary = f"{len(midi_rows)} MIDI events"
             else:
                 midi_summary = "no MIDI"

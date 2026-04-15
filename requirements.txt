@@ -2,3 +2,4 @@ python-rtmidi
 sounddevice
 soundfile
 ntplib
+mido
