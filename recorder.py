@@ -24,6 +24,17 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+_WIN32_AVAILABLE = False
+try:
+    import win32gui
+    import win32con
+    import win32api
+    import ctypes
+    import ctypes.wintypes
+    _WIN32_AVAILABLE = True
+except ImportError:
+    pass
+
 try:
     import ntplib
 except ImportError:
@@ -188,6 +199,9 @@ class AudioRecorder:
         self._viz_chunks: collections.deque = collections.deque()
         self._viz_total_frames: int = 0
         self._viz_max_frames: int = 0
+        # First-callback anchor for precise stream-start detection
+        self._first_callback_perf: float | None = None
+        self._first_callback_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Device enumeration
@@ -221,6 +235,9 @@ class AudioRecorder:
             self._viz_chunks.clear()
             self._viz_total_frames = 0
 
+        self._first_callback_perf = None
+        self._first_callback_event.clear()
+
         self._stream = sd.InputStream(
             device=device_index,
             samplerate=sample_rate,
@@ -238,6 +255,10 @@ class AudioRecorder:
         time_info: object,
         status: sd.CallbackFlags,
     ) -> None:
+        # Capture the precise moment of the first audio sample
+        if self._first_callback_perf is None:
+            self._first_callback_perf = time.perf_counter()
+            self._first_callback_event.set()
         # indata is a view into a PortAudio buffer — always copy before queuing
         chunk = indata.copy()
         self._chunk_queue.put(chunk)
@@ -248,6 +269,11 @@ class AudioRecorder:
             while self._viz_total_frames > self._viz_max_frames and len(self._viz_chunks) > 1:
                 removed = self._viz_chunks.popleft()
                 self._viz_total_frames -= len(removed)
+
+    def wait_for_stream_start(self, timeout: float = 2.0) -> "float | None":
+        """Block until the first PortAudio callback fires. Returns its perf_counter timestamp."""
+        self._first_callback_event.wait(timeout=timeout)
+        return self._first_callback_perf
 
     def stop(self) -> float:
         """
@@ -291,6 +317,114 @@ class AudioRecorder:
                 return None
             chunks = list(self._viz_chunks)
         return np.concatenate(chunks, axis=0)
+
+
+# ---------------------------------------------------------------------------
+# EOS Utility Controller  (Windows only — requires pywin32)
+# ---------------------------------------------------------------------------
+
+class EOSController:
+    """
+    Automates Canon EOS Utility's Remote Live View window via Win32 messages.
+
+    EOS Utility uses owner-drawn WindowsForms buttons with no accessible text.
+    The record button is identified by position: the leftmost WindowsForms BUTTON
+    in the bottom toolbar (y_relative > 70% of the window height).
+    """
+
+    def __init__(self) -> None:
+        self.available: bool = _WIN32_AVAILABLE
+
+    @staticmethod
+    def _find_window(title_fragment: str) -> "int | None":
+        found: list[int] = []
+
+        def _cb(hwnd: int, _: object) -> bool:
+            try:
+                if title_fragment.lower() in win32gui.GetWindowText(hwnd).lower():
+                    found.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_cb, None)
+        return found[0] if found else None
+
+    @staticmethod
+    def _find_record_button(parent_hwnd: int) -> "int | None":
+        """
+        Find the record toggle button by position.
+        EOS Utility Live View: the record button is the leftmost
+        WindowsForms BUTTON whose centre is in the bottom 30% of the window.
+        """
+        win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(parent_hwnd)
+        win_height = win_bottom - win_top
+        if win_height == 0:
+            return None
+
+        candidates: list[tuple[int, int]] = []  # (rel_x, hwnd)
+
+        def _cb(hwnd: int, _: object) -> bool:
+            try:
+                if "BUTTON" not in win32gui.GetClassName(hwnd):
+                    return True
+                r = win32gui.GetWindowRect(hwnd)
+                btn_cy = (r[1] + r[3]) // 2
+                if btn_cy - win_top > win_height * 0.70:
+                    candidates.append(((r[0] + r[2]) // 2 - win_left, hwnd))
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(parent_hwnd, _cb, None)
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda t: t[0])
+        return candidates[0][1]  # leftmost = record button
+
+    def click_record_button(
+        self, title_fragment: str, btn_text: str = ""
+    ) -> "tuple[bool, str]":
+        """Locate the EOS window and click the recording toggle. Returns (ok, message)."""
+        if not _WIN32_AVAILABLE:
+            return False, "pywin32 non disponibile — automazione EOS disabilitata"
+
+        hwnd = self._find_window(title_fragment)
+        if hwnd is None:
+            return False, f'Finestra EOS non trovata (ricerca: "{title_fragment}")'
+
+        window_title = win32gui.GetWindowText(hwnd)
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+
+        child_hwnd = self._find_record_button(hwnd)
+        if child_hwnd is None:
+            return False, f'Pulsante record non trovato in "{window_title}"'
+
+        # Primary: BM_CLICK — works for WindowsForms BUTTON controls
+        try:
+            win32gui.SendMessage(child_hwnd, win32con.BM_CLICK, 0, 0)
+            return True, f'Record — OK in "{window_title}"'
+        except Exception:
+            pass
+
+        # Fallback: physical mouse click at button centre
+        try:
+            r = win32gui.GetWindowRect(child_hwnd)
+            cx = (r[0] + r[2]) // 2
+            cy = (r[1] + r[3]) // 2
+            win32api.SetCursorPos((cx, cy))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, cx, cy, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, cx, cy, 0, 0)
+            return True, f'Record — OK (mouse fallback) in "{window_title}"'
+        except Exception as exc:
+            return False, f'Click fallito in "{window_title}": {exc}'
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +660,7 @@ class RecorderApp(tk.Tk):
         self._recording = False
         self._midi_rec = MidiRecorder()
         self._audio_rec = AudioRecorder()
+        self._eos_ctrl = EOSController()
         self._session_start_perf: float = 0.0
         self._session_start_utc: datetime.datetime | None = None
         self._session_stop_perf: float = 0.0
@@ -646,21 +781,40 @@ class RecorderApp(tk.Tk):
             row=0, column=1, padx=4
         )
 
+        # ---- Canon EOS Utility ----
+        eos_frame = ttk.LabelFrame(self, text="Canon EOS Utility")
+        eos_frame.grid(row=5, column=0, columnspan=2, sticky="ew", **pad)
+
+        self._eos_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            eos_frame,
+            text="Sincronizza registrazione filmato",
+            variable=self._eos_var,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 2))
+
+        ttk.Label(eos_frame, text="Titolo finestra EOS:").grid(
+            row=1, column=0, sticky="w", padx=4, pady=(0, 4)
+        )
+        self._eos_title_var = tk.StringVar(value="live view remoto")
+        ttk.Entry(eos_frame, textvariable=self._eos_title_var, width=30).grid(
+            row=1, column=1, sticky="w", padx=4, pady=(0, 4)
+        )
+
         # ---- Start / Stop ----
         self._start_btn = ttk.Button(
             self, text="▶  START", command=self._toggle_recording, width=22
         )
-        self._start_btn.grid(row=5, column=0, columnspan=2, pady=8)
+        self._start_btn.grid(row=6, column=0, columnspan=2, pady=8)
 
         # ---- Status label ----
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(
             self, textvariable=self._status_var, font=("Segoe UI", 9, "italic")
-        ).grid(row=6, column=0, columnspan=2, pady=(0, 4))
+        ).grid(row=7, column=0, columnspan=2, pady=(0, 4))
 
         # ---- Log ----
         log_frame = ttk.LabelFrame(self, text="Log")
-        log_frame.grid(row=7, column=0, columnspan=2, sticky="nsew", **pad)
+        log_frame.grid(row=8, column=0, columnspan=2, sticky="nsew", **pad)
 
         self._log = scrolledtext.ScrolledText(
             log_frame,
@@ -673,7 +827,7 @@ class RecorderApp(tk.Tk):
 
         # ---- Waveform visualizer ----
         wave_frame = ttk.LabelFrame(self, text="Audio Waveform (real-time)")
-        wave_frame.grid(row=8, column=0, columnspan=2, sticky="ew", **pad)
+        wave_frame.grid(row=9, column=0, columnspan=2, sticky="ew", **pad)
 
         self._wave_canvas = tk.Canvas(
             wave_frame,
@@ -814,22 +968,10 @@ class RecorderApp(tk.Tk):
 
         self._ntp_offset = ntp_offset
 
-        # --- Session anchor: record perf_counter and UTC together ---
-        # Taking perf_counter and utcnow() as close together as possible.
-        self._session_start_perf = time.perf_counter()
-        raw_utc = datetime.datetime.now()
-        self._session_start_utc = raw_utc + datetime.timedelta(seconds=ntp_offset)
-
-        # --- Save session metadata ---
-        self._session_out_dir = out_dir
-        self._session_tag = raw_utc.strftime("%Y-%m-%dT%H-%M-%S")
-        self._session_sr = sample_rate
-        self._session_ch = channels
-
-        # --- Open MIDI port ---
+        # --- Open MIDI port first (its callbacks use perf_counter independently) ---
         if use_midi:
             try:
-                self._midi_rec.start(midi_idx, self._session_start_perf)
+                self._midi_rec.start(midi_idx, 0.0)  # anchor patched below after stream start
             except Exception as exc:
                 messagebox.showerror("MIDI Error", f"Cannot open MIDI port:\n{exc}")
                 return
@@ -843,6 +985,29 @@ class RecorderApp(tk.Tk):
                     self._midi_rec.stop()
                 messagebox.showerror("Audio Error", f"Cannot open audio device:\n{exc}")
                 return
+
+        # --- Session anchor: exact moment of first audio sample ---
+        # Wait for PortAudio to fire its first callback (~5-50 ms after stream open).
+        # If audio is not active, fall back to current perf_counter.
+        if use_audio:
+            stream_perf = self._audio_rec.wait_for_stream_start(timeout=2.0)
+            if stream_perf is None:
+                stream_perf = time.perf_counter()  # timeout fallback
+        else:
+            stream_perf = time.perf_counter()
+
+        # Back-compute UTC at stream_perf from the current wall clock.
+        _now_perf = time.perf_counter()
+        _now_utc = datetime.datetime.now()
+        raw_utc = _now_utc - datetime.timedelta(seconds=_now_perf - stream_perf)
+        self._session_start_perf = stream_perf
+        self._session_start_utc = raw_utc + datetime.timedelta(seconds=ntp_offset)
+
+        # --- Save session metadata ---
+        self._session_out_dir = out_dir
+        self._session_tag = raw_utc.strftime("%Y-%m-%dT%H-%M-%S")
+        self._session_sr = sample_rate
+        self._session_ch = channels
 
         self._recording = True
         self._start_btn.configure(text="⏹  STOP")
@@ -866,11 +1031,26 @@ class RecorderApp(tk.Tk):
         ts_mode_label = f"NTP ({self._ntp_server_var.get()})" if use_ntp else "System clock (UTC)"
         self._log_msg(f"  Clock  → {ts_mode_label}")
 
+        # --- Trigger EOS Utility recording ---
+        if self._eos_var.get():
+            _eos_ok, _eos_msg = self._eos_ctrl.click_record_button(
+                self._eos_title_var.get().strip(),
+                "Avvia/arresta registrazione filmato",
+            )
+            self._log_msg(f"  EOS    → {_eos_msg}")
+
     def _stop_recording(self) -> None:
         if not self._recording:
             return
         self._start_btn.configure(state="disabled", text="Processing…")
         self._status_var.set("Stopping — saving files…")
+        # --- Stop EOS Utility recording ---
+        if self._eos_var.get():
+            _eos_ok, _eos_msg = self._eos_ctrl.click_record_button(
+                self._eos_title_var.get().strip(),
+                "Avvia/arresta registrazione filmato",
+            )
+            self._log_msg(f"  EOS    → {_eos_msg}")
         # Off-load post-processing to a worker thread so the GUI stays responsive
         threading.Thread(target=self._stop_worker, daemon=True).start()
 

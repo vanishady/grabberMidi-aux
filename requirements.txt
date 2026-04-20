@@ -3,3 +3,4 @@ sounddevice
 soundfile
 ntplib
 mido
+pywin32
